@@ -17,10 +17,9 @@
 
 package org.apache.camel.component.kafka.consumer.errorhandler;
 
-import java.util.Set;
-
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.RecordDeserializationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,33 +30,24 @@ final class SeekUtil {
 
     }
 
-    public static void seekToNextOffset(Consumer<?, ?> consumer, long partitionLastOffset) {
-        boolean logged = false;
-        Set<TopicPartition> tps = consumer.assignment();
-        if (tps != null && partitionLastOffset != -1) {
-            long next = partitionLastOffset + 1;
-
-            for (TopicPartition tp : tps) {
-                if (LOG.isInfoEnabled()) {
-                    LOG.info(
-                            "Consumer seeking to next offset {} to continue polling next message from topic {} on partition {}",
-                            next, tp.topic(), tp.partition());
-                }
-
-                consumer.seek(tp, next);
-            }
-        } else if (tps != null) {
-            for (TopicPartition tp : tps) {
-                long next = consumer.position(tp) + 1;
-                if (!logged) {
-                    LOG.info(
-                            "Consumer seeking to next offset {} to continue polling next message from topic {} on partition {}",
-                            next,
-                            tp.topic(), tp.partition());
-                    logged = true;
-                }
-                consumer.seek(tp, next);
-            }
+    /**
+     * Skips the record a poll failed on, if the exception names one. Only a record that can't be deserialized stops
+     * the consumer from moving past it; it is skipped on its own partition. Any other poll exception (network,
+     * timeout, authentication, fencing) is not about a record, so nothing is skipped and the next poll retries.
+     *
+     * @return whether a record was skipped
+     */
+    static boolean seekPastFailedRecord(Consumer<?, ?> consumer, Exception exception) {
+        if (!(exception instanceof RecordDeserializationException)) {
+            LOG.debug("Not skipping any record: {} is not about a record", exception.getClass().getName());
+            return false;
         }
+        RecordDeserializationException e = (RecordDeserializationException) exception;
+        TopicPartition tp = e.topicPartition();
+        long next = e.offset() + 1;
+        LOG.warn("Skipping the record that can't be deserialized: seeking to offset {} on topic {} partition {}",
+                next, tp.topic(), tp.partition());
+        consumer.seek(tp, next);
+        return true;
     }
 }

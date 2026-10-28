@@ -19,6 +19,7 @@ package org.apache.camel.component.kafka;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Properties;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
@@ -39,6 +40,7 @@ import org.apache.camel.util.IOHelper;
 import org.apache.camel.util.ReflectionHelper;
 import org.apache.camel.util.TimeUtils;
 import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -90,6 +92,9 @@ public class KafkaFetchRecords implements Runnable {
 
     private volatile State state = State.RUNNING;
 
+    // Consecutive failed polls; the next poll waits pollFailureBackoffMs after one. Only the fetch thread uses it.
+    private int pollFailures;
+
     KafkaFetchRecords(KafkaConsumer kafkaConsumer,
                       BridgeExceptionHandlerToErrorHandler bridge, String topicName, Pattern topicPattern, String id,
                       Properties kafkaProps, KafkaConsumerListener consumerListener) {
@@ -110,6 +115,9 @@ public class KafkaFetchRecords implements Runnable {
 
         do {
             terminated = false;
+
+            // before reconnecting too, so a fenced consumer doesn't take its group.instance.id straight back
+            waitAfterPollFailure();
 
             if (!isConnected()) {
 
@@ -329,6 +337,7 @@ public class KafkaFetchRecords implements Runnable {
 
             while (isKafkaConsumerRunnableAndNotStopped() && isConnected() && pollExceptionStrategy.canContinue()) {
                 ConsumerRecords<Object, Object> allRecords = consumer.poll(pollDuration);
+                pollFailures = 0;
                 if (consumerListener != null) {
                     if (!consumerListener.afterConsume(consumer)) {
                         continue;
@@ -405,6 +414,7 @@ public class KafkaFetchRecords implements Runnable {
                         e.getClass().getName(), threadId, getPrintableTopic(), e.getMessage());
             }
 
+            pollFailures++;
             pollExceptionStrategy.handle(partitionLastOffset, e);
         } finally {
             // only close if not retry
@@ -413,6 +423,51 @@ public class KafkaFetchRecords implements Runnable {
                 safeConsumerClose();
             }
             lock.unlock();
+        }
+    }
+
+    /*
+     * After a failed poll, waits before polling or reconnecting again, so a consumer can't retry in a tight loop
+     * while Kafka is unavailable. Waits outside the poll lock, in short slices, so stopping the consumer isn't
+     * delayed.
+     */
+    private void waitAfterPollFailure() {
+        if (pollFailures == 0) {
+            return;
+        }
+        long delayMs = pollFailureBackoffMs(
+                longProperty(ConsumerConfig.RECONNECT_BACKOFF_MS_CONFIG, 50),
+                longProperty(ConsumerConfig.RECONNECT_BACKOFF_MAX_MS_CONFIG, 1000),
+                pollFailures, ThreadLocalRandom.current().nextDouble());
+        LOG.info("Waiting {} ms before polling {} again, after {} failed polls", delayMs, getPrintableTopic(), pollFailures);
+        long deadline = System.currentTimeMillis() + delayMs;
+        try {
+            for (long left = delayMs; left > 0 && isKafkaConsumerRunnableAndNotStopped();
+                 left = deadline - System.currentTimeMillis()) {
+                Thread.sleep(Math.min(left, 100));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * The Kafka client's own reconnect backoff: reconnect.backoff.ms doubling per consecutive failure, up to
+     * reconnect.backoff.max.ms, with +/-20% jitter so consumers don't retry in step.
+     *
+     * @param random a number in [0, 1)
+     */
+    static long pollFailureBackoffMs(long initialMs, long maxMs, int failures, double random) {
+        double backoff = Math.min((double) maxMs, initialMs * Math.pow(2, Math.min(failures - 1, 30)));
+        return Math.round(backoff * (0.8 + 0.4 * random));
+    }
+
+    private long longProperty(String key, long defaultValue) {
+        Object value = kafkaProps.get(key);
+        try {
+            return value == null ? defaultValue : Long.parseLong(String.valueOf(value).trim());
+        } catch (NumberFormatException e) {
+            return defaultValue;
         }
     }
 
